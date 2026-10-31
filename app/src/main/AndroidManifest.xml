@@ -21,6 +21,9 @@
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
     <!-- Optional start on boot, off by default -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Recording schedule: exact alarms at each start/stop, CPU kept awake while recording -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <uses-feature android:name="android.hardware.camera.any" />
 
@@ -41,6 +44,10 @@
             android:name=".activities.SettingsActivity"
             android:label="Settings"
             android:parentActivityName=".activities.MainActivity" />
+        <activity
+            android:name=".activities.ScheduleActivity"
+            android:label="Horarios de grabación"
+            android:parentActivityName=".activities.SettingsActivity" />
 
         <service
             android:name=".StreamingService"
@@ -54,7 +61,14 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".ScheduleAlarmReceiver"
+            android:exported="false" />
     </application>
 </manifest>
