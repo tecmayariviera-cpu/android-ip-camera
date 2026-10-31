@@ -93,6 +93,16 @@
     </PreferenceCategory>
 
     <PreferenceCategory android:title="Recording">
+        <CheckBoxPreference
+            android:key="schedule_enabled"
+            android:title="Grabación programada"
+            android:summary="Grabar automáticamente en los horarios definidos"
+            android:defaultValue="false" />
+        <Preference
+            android:key="schedule_rules"
+            android:title="Horarios de grabación"
+            android:summary="Toca para agregar o editar horarios"
+            android:persistent="false" />
         <Preference
             android:key="recording_storage_uri"
             android:title="Recording Storage Location"

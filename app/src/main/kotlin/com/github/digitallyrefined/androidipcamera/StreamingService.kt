@@ -36,6 +36,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.Inet4Address
@@ -93,6 +94,11 @@ class StreamingService : LifecycleService() {
      *  session-bound torch, a setTorchMode torch survives process death. */
     @Volatile private var deviceTorchOn = false
     @Volatile private var localRecorder: LocalRecorder? = null
+    /** True while the current recording was started by the schedule (so only the schedule stops it). */
+    @Volatile private var scheduledRecordingActive = false
+    private val scheduleMutex = Mutex()
+    /** Keeps the CPU awake during a scheduled recording, even with the screen off. */
+    private var scheduleWakeLock: android.os.PowerManager.WakeLock? = null
     /** Smaller encoder feeding the RTSP sub stream (/live/sub) while it has viewers. */
     @Volatile private var subEncoder: H264HardwareEncoder? = null
 
@@ -158,6 +164,10 @@ class StreamingService : LifecycleService() {
         const val ACTION_RESTART_NOTIFICATION = "com.github.digitallyrefined.androidipcamera.RESTART_NOTIFICATION"
         const val ACTION_RESTART_SERVER = "com.github.digitallyrefined.androidipcamera.RESTART_SERVER"
         const val ACTION_START_SERVER = "com.github.digitallyrefined.androidipcamera.START_SERVER"
+        /** Sent by the schedule alarm, at boot and after schedule edits: start/stop to match the schedule. */
+        const val ACTION_SCHEDULE_CHECK = "com.github.digitallyrefined.androidipcamera.SCHEDULE_CHECK"
+        /** Retry delay when a scheduled start fails (camera busy, encoder not ready, ...). */
+        private const val SCHEDULE_RETRY_MS = 60_000L
     }
 
     inner class LocalBinder : Binder() { fun getService(): StreamingService = this@StreamingService }
@@ -172,6 +182,7 @@ class StreamingService : LifecycleService() {
             // Cold start with no activity bound (e.g. from BootReceiver): the activity normally
             // calls startStreamingServer() after binding, so start it here instead.
             ACTION_START_SERVER -> startStreamingServer()
+            ACTION_SCHEDULE_CHECK -> launchScheduleCheck()
         }
         // A null intent means the system re-created this START_STICKY service after killing the
         // process. Nothing starts the server in that path — no activity binds, and onCreate() only
@@ -241,6 +252,8 @@ class StreamingService : LifecycleService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             try { unregisterReceiver(notificationChannelReceiver) } catch (_: Exception) {}
         safeStopRecording()
+        scheduledRecordingActive = false
+        releaseScheduleWakeLock()
         // The service is going away, so the torch has nothing left to keep the camera open for;
         // clearing this first stops the guard in stopCamera() from leaking the session.
         cameraHeldForTorch = false
@@ -396,6 +409,9 @@ class StreamingService : LifecycleService() {
         startOnvifIfEnabled()
         // Motion detection persisted as on keeps the camera running with no viewer.
         if (motionEnabled()) launchMain { startCameraIfNeeded() }
+        // If the server comes up inside a scheduled window (app opened, boot, process restart),
+        // start recording now and arm the next alarm.
+        launchScheduleCheck()
     }
 
     /** Starts (or stops) the RTSP server to match the RTSP/ONVIF setting. ONVIF is enabled by the
@@ -1739,6 +1755,10 @@ class StreamingService : LifecycleService() {
     }
 
     fun stopRecording(): RecordingResponse {
+        // A manual stop also ends a scheduled recording; the schedule won't restart it until the
+        // next window (or the next check finds us inside one again).
+        scheduledRecordingActive = false
+        releaseScheduleWakeLock()
         val recorder = localRecorder ?: return Triple(false, "409 Conflict",
             """{"error":"not_recording","message":"No recording is in progress"}"""
         )
@@ -1781,6 +1801,85 @@ class StreamingService : LifecycleService() {
                 stopCamera()
             }
         }
+    }
+
+    // ---------------- scheduled recording ----------------
+
+    private fun launchScheduleCheck() {
+        lifecycleScope.launch(Dispatchers.IO) { reconcileSchedule() }
+    }
+
+    /**
+     * Brings the recorder in line with the schedule: start when inside a window and idle, stop when
+     * outside a window and the running recording is one the schedule started. Recordings started by
+     * hand are never stopped by the schedule. Always re-arms the alarm for the next boundary.
+     */
+    private suspend fun reconcileSchedule() = scheduleMutex.withLock {
+        var retryAt: Long? = null
+        try {
+            val should = RecordingScheduler.shouldRecordNow(this)
+            val recording = localRecorder?.isRecording == true
+            when {
+                should && !recording -> {
+                    if (!waitForEncoderSetup()) {
+                        Log.w(TAG, "Scheduled start: server/encoder not ready, retrying in 1 min")
+                        retryAt = System.currentTimeMillis() + SCHEDULE_RETRY_MS
+                    } else {
+                        val (ok, status, json) = startRecording()
+                        if (ok) {
+                            scheduledRecordingActive = true
+                            acquireScheduleWakeLock()
+                            Log.i(TAG, "Scheduled recording started: $json")
+                        } else {
+                            Log.w(TAG, "Scheduled start failed ($status): $json")
+                            retryAt = System.currentTimeMillis() + SCHEDULE_RETRY_MS
+                        }
+                    }
+                }
+                !should && recording && scheduledRecordingActive -> {
+                    val (_, status, _) = stopRecording()
+                    Log.i(TAG, "Scheduled recording stopped ($status)")
+                }
+                !recording && scheduledRecordingActive -> {
+                    // The recorder went away underneath us (error, camera lost): reset our flag.
+                    scheduledRecordingActive = false
+                    releaseScheduleWakeLock()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Schedule check failed", e)
+            retryAt = System.currentTimeMillis() + SCHEDULE_RETRY_MS
+        } finally {
+            RecordingScheduler.armNextAlarm(this, retryAt)
+        }
+    }
+
+    /** startRecording() needs the H.264 encoder, which exists only once the server is set up. */
+    private suspend fun waitForEncoderSetup(): Boolean {
+        if (h264StreamingEncoder != null) return true
+        if (streamingServerHelper == null) withContext(Dispatchers.Main) { startStreamingServer() }
+        repeat(50) {
+            if (h264StreamingEncoder != null) return true
+            kotlinx.coroutines.delay(200)
+        }
+        return h264StreamingEncoder != null
+    }
+
+    private fun acquireScheduleWakeLock() {
+        if (scheduleWakeLock?.isHeld == true) return
+        try {
+            val pm = getSystemService(android.os.PowerManager::class.java)
+            scheduleWakeLock = pm.newWakeLock(
+                android.os.PowerManager.PARTIAL_WAKE_LOCK, "AndroidIPCamera:ScheduledRecording"
+            ).apply { setReferenceCounted(false); acquire() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Wake lock unavailable: ${e.message}")
+        }
+    }
+
+    private fun releaseScheduleWakeLock() {
+        try { scheduleWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
+        scheduleWakeLock = null
     }
 
     /** Safely stops any active recording (used in stopCamera/onDestroy safety nets). */

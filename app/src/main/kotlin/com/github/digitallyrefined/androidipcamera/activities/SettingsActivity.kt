@@ -17,6 +17,7 @@ import com.github.digitallyrefined.androidipcamera.R
 import com.github.digitallyrefined.androidipcamera.StreamingService
 import com.github.digitallyrefined.androidipcamera.helpers.InputValidator
 import com.github.digitallyrefined.androidipcamera.helpers.ListenInterface
+import com.github.digitallyrefined.androidipcamera.helpers.RecordingScheduler
 import com.github.digitallyrefined.androidipcamera.helpers.RecordingsHelper
 import com.github.digitallyrefined.androidipcamera.helpers.RtspServer
 import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
@@ -360,6 +361,21 @@ class SettingsActivity : AppCompatActivity() {
                 }
             }
 
+            // Recording schedule: master switch + editor screen
+            findPreference<androidx.preference.CheckBoxPreference>(RecordingScheduler.PREF_ENABLED)?.setOnPreferenceChangeListener { _, _ ->
+                // Let the preference save first, then have the service start/stop and re-arm.
+                Handler(Looper.getMainLooper()).post {
+                    RecordingScheduler.requestCheck(requireContext())
+                    updateScheduleSummary()
+                }
+                true
+            }
+            findPreference<Preference>("schedule_rules")?.setOnPreferenceClickListener {
+                startActivity(Intent(requireContext(), ScheduleActivity::class.java))
+                true
+            }
+            updateScheduleSummary()
+
             // Configure the video recording storage location (defaults to Movies/AndroidIPCamera)
             findPreference<Preference>("recording_storage_uri")?.apply {
                 summary = recordingStorageSummary()
@@ -557,6 +573,16 @@ class SettingsActivity : AppCompatActivity() {
                 ?: return "Default: ${RecordingsHelper.DEFAULT_RELATIVE_PATH}"
             val name = DocumentFile.fromTreeUri(requireContext(), uri)?.name
             return "Custom folder: ${name ?: uri}"
+        }
+
+        override fun onResume() {
+            super.onResume()
+            updateScheduleSummary()
+        }
+
+        private fun updateScheduleSummary() {
+            val ctx = context ?: return
+            findPreference<Preference>("schedule_rules")?.summary = ScheduleActivity.summary(ctx)
         }
 
         private fun setRtspOptionsVisible(visible: Boolean) {

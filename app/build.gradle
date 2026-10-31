@@ -33,6 +33,14 @@ android {
     }
 
     signingConfigs {
+        // Fixed debug key kept in the repo so every cloud (GitHub Actions) build can be installed
+        // over the previous one. Debug builds only; never used for release.
+        debug {
+            storeFile file('schedule-debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
         release {
           if (skipSigning) {
               // Unsigned release builds for reproducible build verification.
